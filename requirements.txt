@@ -14,3 +14,4 @@ optuna>=3.0.0
 plotly>=5.10.0
 imbalanced-learn>=0.9.0
 reportlab
+openpyxl
