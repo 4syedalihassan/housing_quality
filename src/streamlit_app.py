@@ -9,11 +9,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.impute import KNNImputer
 from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+from sklearn.feature_selection import SelectKBest, f_classif
 import pandera as pa
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
@@ -27,7 +28,7 @@ warnings.filterwarnings('ignore')
 
 # Configure page
 st.set_page_config(page_title="Housing Quality Prediction Pipeline", layout="wide")
-st.title("🏠 Advanced Housing Quality Assessment & Prediction Pipeline")
+st.title("🏠 Housing Quality Assessment & Prediction Pipeline")
 
 # Enhanced Schema
 schema = pa.DataFrameSchema(
@@ -128,6 +129,380 @@ def encode_categorical_features(df):
         st.warning(f"Could not create garage features: {e}")
 
     return encoded_df, categorical_features
+
+
+def improved_feature_engineering(df):
+    """Enhanced feature engineering with better handling of categorical variables"""
+
+    # Create a copy to avoid modifying original data
+    features_df = df.copy()
+
+    # 1. Handle missing values more intelligently
+    # For numeric columns, use median within similar property types
+    numeric_cols = ['Area', 'YearBuilt', 'YearRemodAdd', 'BedroomAbvGr', 'KitchenAbvGr']
+
+    for col in numeric_cols:
+        if col in features_df.columns:
+            # Group by BldgType if available for more intelligent imputation
+            if 'BldgType' in features_df.columns:
+                features_df[col] = features_df.groupby('BldgType')[col].transform(
+                    lambda x: x.fillna(x.median())
+                )
+            # Fallback to overall median
+            features_df[col] = features_df[col].fillna(features_df[col].median())
+
+    # 2. Create meaningful derived features
+    if 'YearBuilt' in features_df.columns:
+        features_df['PropertyAge'] = 2025 - features_df['YearBuilt']
+        features_df['IsVintage'] = (features_df['PropertyAge'] > 50).astype(int)
+        features_df['IsNew'] = (features_df['PropertyAge'] <= 10).astype(int)
+
+    if 'YearRemodAdd' in features_df.columns and 'YearBuilt' in features_df.columns:
+        features_df['YearsSinceRemodel'] = 2025 - features_df['YearRemodAdd']
+        features_df['WasRemodeled'] = (features_df['YearRemodAdd'] > features_df['YearBuilt']).astype(int)
+
+    if 'Area' in features_df.columns:
+        features_df['AreaPerBedroom'] = features_df['Area'] / (features_df.get('BedroomAbvGr', 3) + 1)
+        features_df['LogArea'] = np.log1p(features_df['Area'])  # Log transform for better distribution
+
+    # 3. Better garage encoding
+    if 'Garage' in features_df.columns:
+        garage_quality_map = {
+            'BuiltIn': 5, 'Attchd': 4, '2Types': 3,
+            'Detchd': 2, 'Basement': 1, 'Unknown': 0
+        }
+        features_df['GarageQuality'] = features_df['Garage'].map(garage_quality_map).fillna(0)
+
+        # Create binary features for garage types
+        for garage_type in ['BuiltIn', 'Attchd', 'Detchd']:
+            features_df[f'Is{garage_type}Garage'] = (features_df['Garage'] == garage_type).astype(int)
+
+    # 4. Handle categorical variables with target encoding for high cardinality
+    categorical_cols = ['HouseStyle', 'BldgType', 'Location']
+
+    for col in categorical_cols:
+        if col in features_df.columns:
+            # Simple label encoding for now (can be improved with target encoding)
+            le = LabelEncoder()
+            features_df[f'{col}_encoded'] = le.fit_transform(features_df[col].astype(str))
+
+            # Create dummy variables for most frequent categories
+            top_categories = features_df[col].value_counts().head(3).index
+            for cat in top_categories:
+                features_df[f'{col}_{cat}'] = (features_df[col] == cat).astype(int)
+
+    # 5. Interaction features
+    if 'OverallQual' in features_df.columns and 'OverallCond' in features_df.columns:
+        features_df['QualCondInteraction'] = features_df['OverallQual'] * features_df['OverallCond']
+        features_df['QualCondDiff'] = features_df['OverallQual'] - features_df['OverallCond']
+
+    return features_df
+
+
+def create_stable_target_classes(y, n_classes=4):
+    """Create stable target classes using quantile-based binning"""
+
+    # Remove missing values
+    y_clean = y.dropna()
+
+    if len(y_clean) == 0:
+        raise ValueError("No valid target values found")
+
+    # Use quantile-based binning for more stable results
+    quantiles = np.linspace(0, 1, n_classes + 1)
+    bins = y_clean.quantile(quantiles).unique()
+
+    # Ensure we have enough unique bins
+    if len(bins) < 2:
+        # Fallback to simple binning
+        y_min, y_max = y_clean.min(), y_clean.max()
+        bins = np.linspace(y_min, y_max + 0.1, n_classes + 1)
+
+    # Create labels
+    labels = ['Low', 'Medium-Low', 'Medium-High', 'High'][:len(bins) - 1]
+
+    # Create classes
+    y_class = pd.cut(y, bins=bins, labels=labels, include_lowest=True)
+
+    return y_class, bins, labels
+
+
+def get_feature_importance(model, feature_names, top_n=10):
+    """Extract and return feature importance"""
+
+    if hasattr(model, 'feature_importances_'):
+        importance = model.feature_importances_
+    elif hasattr(model, 'coef_'):
+        # For logistic regression, use absolute values of coefficients
+        if len(model.coef_.shape) > 1:
+            importance = np.abs(model.coef_).mean(axis=0)
+        else:
+            importance = np.abs(model.coef_[0])
+    else:
+        return None
+
+    # Create importance dataframe
+    importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': importance
+    }).sort_values('importance', ascending=False).head(top_n)
+
+    return importance_df
+
+
+def run_improved_analysis(df, target_col='OverallQual'):
+    """Run the improved analysis pipeline"""
+
+    try:
+        st.write(f"🔍 Building model for {target_col}")
+        st.write(f"📊 Initial data shape: {df.shape}")
+
+        # Check data columns first
+        st.write(f"📋 Available columns: {list(df.columns)}")
+
+        # Feature engineering
+        features_df = improved_feature_engineering(df)
+        st.write(f"⚙️ After feature engineering: {features_df.shape}")
+
+        # Select features (exclude target and non-predictive columns)
+        exclude_cols = [target_col, 'Id'] + [col for col in df.columns if col.startswith('Unnamed')]
+        feature_cols = [col for col in features_df.columns if col not in exclude_cols]
+
+        # Ensure we have the target
+        if target_col not in features_df.columns:
+            st.error(f"❌ Target column {target_col} not found in data")
+            return None
+
+        # Prepare features and target
+        X = features_df[feature_cols].copy()
+        y = features_df[target_col].copy()
+
+        st.write(f"🎯 Target column ({target_col}) stats: min={y.min()}, max={y.max()}, missing={y.isna().sum()}")
+
+        # Remove rows where target is missing
+        valid_mask = ~y.isna()
+        X = X[valid_mask]
+        y = y[valid_mask]
+
+        st.write(f"✅ After removing missing targets: {X.shape}")
+
+        if len(X) < 20:
+            st.error(f"❌ Insufficient data for modeling: only {len(X)} samples (need at least 20)")
+            return None
+
+        # Handle remaining missing values in features
+        missing_count = X.isna().sum().sum()
+        st.write(f"🔧 Missing Values Check: {missing_count} missing values found")
+
+        # Fill missing values more robustly
+        for col in X.columns:
+            if X[col].dtype in ['float64', 'int64']:
+                # Use median for numeric columns
+                median_val = X[col].median()
+                if pd.isna(median_val):  # If all values are NaN
+                    median_val = 0
+                X[col] = X[col].fillna(median_val)
+            elif X[col].dtype.name == 'category':
+                # Handle categorical columns specially
+                mode_val = X[col].mode()
+                if len(mode_val) > 0:
+                    fill_val = mode_val[0]
+                else:
+                    # If no mode, use the first category
+                    fill_val = X[col].cat.categories[0] if len(X[col].cat.categories) > 0 else 'Unknown'
+                    # Add 'Unknown' to categories if it doesn't exist
+                    if fill_val == 'Unknown' and 'Unknown' not in X[col].cat.categories:
+                        X[col] = X[col].cat.add_categories(['Unknown'])
+                X[col] = X[col].fillna(fill_val)
+            else:
+                # Use mode for other object columns
+                mode_val = X[col].mode()
+                fill_val = mode_val[0] if len(mode_val) > 0 else 'Unknown'
+                X[col] = X[col].fillna(fill_val)
+
+        # Convert all columns to numeric where possible
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                try:
+                    X[col] = pd.to_numeric(X[col], errors='coerce')
+                    X[col] = X[col].fillna(0)
+                except:
+                    # If conversion fails, use label encoding
+                    le = LabelEncoder()
+                    X[col] = le.fit_transform(X[col].astype(str))
+            elif X[col].dtype.name == 'category':
+                # Convert categorical to numeric using label encoding
+                le = LabelEncoder()
+                X[col] = le.fit_transform(X[col].astype(str))
+
+        # Final check for any remaining NaN values
+        X = X.fillna(0)
+        y = y.fillna(y.median())
+
+        final_missing_X = X.isna().sum().sum()
+        final_missing_y = y.isna().sum()
+        st.write(f"✅ After preprocessing: X shape {X.shape}, y shape {y.shape}")
+        st.write(f"✅ Final missing values: X={final_missing_X}, y={final_missing_y}")
+
+        # Create classification problem with better binning
+        y_min, y_max = y.min(), y.max()
+        st.write(f"📈 Target value range: {y_min} to {y_max}")
+
+        # Create bins based on actual data distribution
+        # Use quantile-based binning for any range of values
+        try:
+            bins = [y_min - 0.1, y.quantile(0.33), y.quantile(0.67), y_max + 0.1]
+            labels = ['Low', 'Medium', 'High']
+        except:
+            # Fallback to simple binning if quantiles fail
+            bin_width = (y_max - y_min) / 3
+            bins = [y_min - 0.1, y_min + bin_width, y_min + 2 * bin_width, y_max + 0.1]
+            labels = ['Low', 'Medium', 'High']
+
+        y_class = pd.cut(y, bins=bins, labels=labels, include_lowest=True)
+
+        # Remove any NaN values created by binning
+        valid_class_mask = ~y_class.isna()
+        X = X[valid_class_mask]
+        y_class = y_class[valid_class_mask]
+
+        st.write(f"🎯 After classification binning: {len(X)} samples")
+        class_counts = y_class.value_counts()
+        st.write("📊 Class distribution:")
+        for class_name, count in class_counts.items():
+            st.write(f"  - {class_name}: {count} samples")
+
+        if len(X) < 10:
+            st.error(f"❌ Insufficient samples for modeling: {len(X)} (need at least 10)")
+            return None
+
+        # Check if we have enough samples for each class
+        min_class_size = class_counts.min()
+        if min_class_size < 2:
+            st.warning(f"⚠️ Some classes have very few samples (minimum: {min_class_size}). Removing small classes.")
+            # Remove classes with only 1 sample
+            valid_classes = class_counts[class_counts >= 2].index
+            mask = y_class.isin(valid_classes)
+            X = X[mask]
+            y_class = y_class[mask]
+            st.write(f"✅ After removing small classes: {len(X)} samples")
+
+        # Feature selection - select top features based on variance and correlation
+        if X.shape[1] > 20:
+            selector = SelectKBest(score_func=f_classif, k=min(20, X.shape[1]))
+            X_selected = selector.fit_transform(X, y_class)
+            selected_features = X.columns[selector.get_support()].tolist()
+            X = pd.DataFrame(X_selected, columns=selected_features, index=X.index)
+            st.write(f"🎯 Selected {len(selected_features)} best features")
+
+        # Scale features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        X_scaled = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
+
+        # Define models with better parameters
+        models = {
+            'Random Forest': RandomForestClassifier(
+                n_estimators=50,  # Reduced for faster training
+                max_depth=10,
+                min_samples_split=5,
+                min_samples_leaf=2,
+                random_state=42,
+                class_weight='balanced'
+            ),
+            'Gradient Boosting': GradientBoostingClassifier(
+                n_estimators=50,  # Reduced for faster training
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42
+            ),
+            'Logistic Regression': LogisticRegression(
+                random_state=42,
+                max_iter=1000,
+                class_weight='balanced',
+                C=1.0
+            )
+        }
+
+        # Add SVM for smaller datasets
+        if len(X_scaled) < 500:  # Reduced threshold
+            models['SVM'] = SVC(
+                random_state=42,
+                probability=True,
+                class_weight='balanced',
+                C=1.0,
+                gamma='scale'
+            )
+
+        # Cross-validation setup
+        n_splits = min(3, len(y_class.value_counts()))  # Reduced CV folds
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        results = {}
+
+        st.write(f"🤖 Training {len(models)} models with {n_splits}-fold cross-validation...")
+
+        for name, model in models.items():
+            try:
+                with st.spinner(f"Training {name}..."):
+                    # Cross-validation scores
+                    cv_scores = cross_val_score(model, X_scaled, y_class, cv=cv, scoring='accuracy')
+                    cv_f1_scores = cross_val_score(model, X_scaled, y_class, cv=cv, scoring='f1_weighted')
+
+                    # Fit model on full data for feature importance
+                    model.fit(X_scaled, y_class)
+
+                    results[name] = {
+                        'model': model,
+                        'cv_accuracy_mean': cv_scores.mean(),
+                        'cv_accuracy_std': cv_scores.std(),
+                        'cv_f1_mean': cv_f1_scores.mean(),
+                        'cv_f1_std': cv_f1_scores.std(),
+                        'feature_names': X.columns.tolist()
+                    }
+
+                    st.write(f"✅ {name}: Accuracy {cv_scores.mean():.3f} ± {cv_scores.std():.3f}, "
+                             f"F1 {cv_f1_scores.mean():.3f} ± {cv_f1_scores.std():.3f}")
+
+            except Exception as e:
+                st.warning(f"⚠️ Error training {name}: {str(e)}")
+                continue
+
+        if not results:
+            st.error("❌ No models trained successfully")
+            return None
+
+        # Find best model
+        best_model_name = max(results.keys(), key=lambda k: results[k]['cv_accuracy_mean'])
+        best_model = results[best_model_name]['model']
+
+        st.success(f"🏆 Best model: {best_model_name}")
+        st.success(f"📊 Best CV Accuracy: {results[best_model_name]['cv_accuracy_mean']:.3f}")
+        st.success(f"📊 Best CV F1-Score: {results[best_model_name]['cv_f1_mean']:.3f}")
+
+        # Feature importance
+        importance_df = get_feature_importance(best_model, X.columns.tolist())
+        if importance_df is not None:
+            st.write(f"🎯 Top 5 Most Important Features:")
+            for idx, row in importance_df.head().iterrows():
+                st.write(f"  - {row['feature']}: {row['importance']:.4f}")
+
+        return {
+            'results': results,
+            'best_model_name': best_model_name,
+            'best_model': best_model,
+            'feature_importance': importance_df,
+            'scaler': scaler,
+            'bins': bins,
+            'labels': labels,
+            'feature_names': X.columns.tolist()
+        }
+
+    except Exception as e:
+        st.error(f"❌ Error in analysis: {str(e)}")
+        import traceback
+        st.error(f"📝 Full error details: {traceback.format_exc()}")
+        return None
 
 
 def explore_dataset(df):
@@ -263,7 +638,7 @@ def explore_dataset(df):
 
 
 def build_quality_prediction_model(df):
-    """Build and evaluate quality prediction models with robust error handling"""
+    """Updated model building function for Streamlit app"""
     st.subheader("🤖 Quality Prediction Modeling")
 
     # Initial data validation
@@ -290,320 +665,89 @@ def build_quality_prediction_model(df):
         help="Choose whether to predict Overall Quality or Overall Condition"
     )
 
-    # Check target variable
-    target_series = df[target_choice].dropna()
-    if len(target_series) == 0:
-        st.error(f"❌ No valid values found in {target_choice} column.")
-        return None, None, None, None
-
-    st.write(f"**Target Variable Info**: {target_choice} has {len(target_series)} valid values")
-    st.write(f"**Target Range**: {target_series.min()} to {target_series.max()}")
-
-    # Feature engineering with better error handling
     try:
-        encoded_df, cat_features = encode_categorical_features(df)
-        st.write(f"**After Encoding**: {len(encoded_df)} rows, {len(encoded_df.columns)} columns")
-    except Exception as e:
-        st.warning(f"⚠️ Error in categorical encoding: {e}")
-        encoded_df = df.copy()
-        cat_features = {}
+        with st.spinner("🔧 Engineering features and training models..."):
+            # Use the improved analysis function
+            analysis_results = run_improved_analysis(df, target_choice)
 
-    # Define base feature columns that are most likely to exist
-    base_features = ['Area', 'YearBuilt', 'YearRemodAdd', 'BedroomAbvGr', 'KitchenAbvGr']
-    feature_cols = []
+            if analysis_results is None:
+                st.error("❌ Model training failed. Please check your data.")
+                return None, None, None, None
 
-    # Add base features if they exist
-    for col in base_features:
-        if col in encoded_df.columns:
-            feature_cols.append(col)
+            results = analysis_results['results']
+            best_model_name = analysis_results['best_model_name']
+            feature_importance = analysis_results['feature_importance']
 
-    # Add garage features if available
-    garage_features = ['garage_type_encoded', 'garage_quality_score', 'garage_age']
-    for col in garage_features:
-        if col in encoded_df.columns:
-            feature_cols.append(col)
+        # Display results
+        col1, col2 = st.columns(2)
 
-    # Add the other quality measure as a feature if available
-    if target_choice == 'OverallQual' and 'OverallCond' in encoded_df.columns:
-        feature_cols.append('OverallCond')
-    elif target_choice == 'OverallCond' and 'OverallQual' in encoded_df.columns:
-        feature_cols.append('OverallQual')
+        with col1:
+            st.write(f"**{target_choice} Prediction Model Performance (Cross-Validation):**")
+            performance_data = []
 
-    # Add encoded categorical features
-    for col in encoded_df.columns:
-        if any(cat in col for cat in ['HouseStyle_', 'LandContour_', 'BldgType_', 'Location_']):
-            feature_cols.append(col)
+            for name, model_results in results.items():
+                accuracy = model_results['cv_accuracy_mean']
+                f1_score = model_results['cv_f1_mean']
 
-    # Remove duplicates and ensure features exist
-    available_features = list(set([col for col in feature_cols if col in encoded_df.columns]))
+                performance_data.append({
+                    'Model': name,
+                    'Accuracy': f"{accuracy:.3f} ± {model_results['cv_accuracy_std']:.3f}",
+                    'F1-Score': f"{f1_score:.3f} ± {model_results['cv_f1_std']:.3f}",
+                    'Status': '🥇 Best' if name == best_model_name else '✅ Good'
+                })
 
-    if not available_features:
-        st.error("❌ No suitable features found for modeling.")
-        st.write("**Available columns:**", list(encoded_df.columns))
-        return None, None, None, None
-
-    st.write(
-        f"**Selected Features ({len(available_features)})**: {', '.join(available_features[:10])}{'...' if len(available_features) > 10 else ''}")
-
-    # Prepare data with robust preprocessing
-    try:
-        X = encoded_df[available_features].copy()
-        y = encoded_df[target_choice].copy()
-
-        st.write(f"**Before Preprocessing**: X shape {X.shape}, y shape {y.shape}")
-
-        # Remove rows where target is missing
-        valid_target_mask = ~y.isna()
-        X = X[valid_target_mask]
-        y = y[valid_target_mask]
-
-        st.write(f"**After Target Filtering**: X shape {X.shape}, y shape {y.shape}")
-
-        if len(X) == 0:
-            st.error("❌ No valid samples after removing missing target values.")
-            return None, None, None, None
-
-        # Handle missing values in features
-        st.write(f"**Missing Values Check**: {X.isna().sum().sum()} missing values found")
-
-        # Fill missing values more robustly
-        for col in X.columns:
-            if X[col].dtype in ['float64', 'int64']:
-                # Use median for numeric columns
-                median_val = X[col].median()
-                if pd.isna(median_val):  # If all values are NaN
-                    median_val = 0
-                X[col] = X[col].fillna(median_val)
-            else:
-                # Use mode for categorical columns
-                mode_val = X[col].mode()
-                fill_val = mode_val[0] if len(mode_val) > 0 else 'Unknown'
-                X[col] = X[col].fillna(fill_val)
-
-        # Convert all columns to numeric where possible
-        for col in X.columns:
-            if X[col].dtype == 'object':
-                try:
-                    X[col] = pd.to_numeric(X[col], errors='coerce')
-                    X[col] = X[col].fillna(0)
-                except:
-                    # If conversion fails, use label encoding
-                    from sklearn.preprocessing import LabelEncoder
-                    le = LabelEncoder()
-                    X[col] = le.fit_transform(X[col].astype(str))
-
-        # Final check for any remaining NaN values
-        X = X.fillna(0)
-        y = y.fillna(y.median())
-
-        st.write(f"**After Preprocessing**: X shape {X.shape}, y shape {y.shape}")
-        st.write(f"**Remaining Missing Values**: X: {X.isna().sum().sum()}, y: {y.isna().sum()}")
-
-    except Exception as e:
-        st.error(f"❌ Error in data preprocessing: {e}")
-        return None, None, None, None
-
-    # Create classification problem with better binning
-    try:
-        # Check the actual range of target values
-        y_min, y_max = y.min(), y.max()
-        st.write(f"**Target Value Range**: {y_min} to {y_max}")
-
-        # Create bins based on actual data distribution
-        if y_max <= 10:  # Assuming quality scale 1-10
-            # Use quantile-based binning for better distribution
-            bins = [0, y.quantile(0.25), y.quantile(0.5), y.quantile(0.75), y_max + 0.1]
-            labels = ['Low', 'Medium-Low', 'Medium-High', 'High']
-        else:
-            # Use equal-width binning
-            bin_width = (y_max - y_min) / 4
-            bins = [y_min - 0.1, y_min + bin_width, y_min + 2 * bin_width, y_min + 3 * bin_width, y_max + 0.1]
-            labels = ['Low', 'Medium-Low', 'Medium-High', 'High']
-
-        y_class = pd.cut(y, bins=bins, labels=labels, include_lowest=True)
-
-        # Remove any NaN values created by binning
-        valid_class_mask = ~y_class.isna()
-        X = X[valid_class_mask]
-        y_class = y_class[valid_class_mask]
-
-        st.write(f"**After Classification Binning**: {len(X)} samples")
-        st.write(f"**Class Distribution**:")
-        class_counts = y_class.value_counts()
-        for class_name, count in class_counts.items():
-            st.write(f"  - {class_name}: {count} samples")
-
-        if len(X) < 10:
-            st.error("❌ Insufficient samples for modeling (need at least 10 samples).")
-            return None, None, None, None
-
-        # Check if we have enough samples for each class
-        min_class_size = class_counts.min()
-        if min_class_size < 2:
-            st.warning(
-                f"⚠️ Some classes have very few samples (minimum: {min_class_size}). Consider collecting more data.")
-            # Remove classes with only 1 sample
-            valid_classes = class_counts[class_counts >= 2].index
-            mask = y_class.isin(valid_classes)
-            X = X[mask]
-            y_class = y_class[mask]
-            st.write(f"**After Removing Small Classes**: {len(X)} samples")
-
-    except Exception as e:
-        st.error(f"❌ Error in creating classification problem: {e}")
-        return None, None, None, None
-
-    # Split data with proper validation
-    try:
-        # Adjust test size if dataset is small
-        test_size = min(0.2, max(0.1, len(X) * 0.2 / len(X)))  # Ensure reasonable split
-
-        if len(X) < 20:
-            test_size = 0.3  # Use larger test set for very small datasets
-
-        # Check if stratification is possible
-        unique_classes = y_class.value_counts()
-        if unique_classes.min() >= 2:  # All classes have at least 2 samples
-            stratify = y_class
-        else:
-            stratify = None
-            st.warning("⚠️ Cannot stratify split due to class imbalance.")
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_class,
-            test_size=test_size,
-            random_state=42,
-            stratify=stratify
-        )
-
-        st.write(f"**Data Split**: Train: {len(X_train)}, Test: {len(X_test)}")
-
-    except Exception as e:
-        st.error(f"❌ Error in data splitting: {e}")
-        return None, None, None, None
-
-    # Train models with error handling
-    models = {
-        'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),
-        'Random Forest': RandomForestClassifier(n_estimators=50, random_state=42, max_depth=10),  # Reduced complexity
-        'Gradient Boosting': GradientBoostingClassifier(n_estimators=50, random_state=42, max_depth=5)
-        # Reduced complexity
-    }
-
-    # Add SVM only if dataset is not too large
-    if len(X_train) < 1000:
-        models['SVM'] = SVC(random_state=42, probability=True)
-
-    results = {}
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write(f"**{target_choice} Prediction Model Performance:**")
-        performance_data = []
-
-        for name, model in models.items():
-            try:
-                with st.spinner(f"Training {name}..."):
-                    # Train model
-                    model.fit(X_train, y_train)
-
-                    # Predictions
-                    y_pred = model.predict(X_test)
-                    y_pred_proba = model.predict_proba(X_test) if hasattr(model, 'predict_proba') else None
-
-                    # Metrics
-                    accuracy = accuracy_score(y_test, y_pred)
-                    f1 = f1_score(y_test, y_pred, average='weighted')
-
-                    results[name] = {
-                        'model': model,
-                        'accuracy': accuracy,
-                        'f1_score': f1,
-                        'predictions': y_pred,
-                        'probabilities': y_pred_proba
-                    }
-
-                    performance_data.append({
-                        'Model': name,
-                        'Accuracy': f"{accuracy:.3f}",
-                        'F1-Score': f"{f1:.3f}"
-                    })
-
-                    st.success(f"✅ {name} trained successfully")
-
-            except Exception as e:
-                st.warning(f"⚠️ Model {name} failed: {e}")
-                continue
-
-        if performance_data:
             performance_df = pd.DataFrame(performance_data)
             st.dataframe(performance_df, hide_index=True)
-        else:
-            st.error("❌ No models trained successfully.")
-            return None, None, available_features, target_choice
 
-    with col2:
-        # Feature importance for best model
-        if results:
-            best_model_name = max(results.keys(), key=lambda k: results[k]['accuracy'])
-            best_model = results[best_model_name]['model']
+            # Highlight best performance
+            best_accuracy = results[best_model_name]['cv_accuracy_mean']
+            best_f1 = results[best_model_name]['cv_f1_mean']
 
-            if hasattr(best_model, 'feature_importances_'):
-                importance_df = pd.DataFrame({
-                    'Feature': available_features,
-                    'Importance': best_model.feature_importances_
-                }).sort_values('Importance', ascending=False).head(10)
+            st.success(f"🎯 **Best Model**: {best_model_name}")
+            st.success(f"📊 **Performance**: {best_accuracy:.3f} accuracy, {best_f1:.3f} F1-score")
 
-                fig_imp = px.bar(importance_df, x='Importance', y='Feature',
-                                 orientation='h', title=f'Top Features ({best_model_name})')
+        with col2:
+            # Feature importance visualization
+            if feature_importance is not None:
+                fig_imp = px.bar(
+                    feature_importance.head(10),
+                    x='importance',
+                    y='feature',
+                    orientation='h',
+                    title=f'Top 10 Features ({best_model_name})'
+                )
                 fig_imp.update_layout(height=400)
                 st.plotly_chart(fig_imp, use_container_width=True)
-            elif hasattr(best_model, 'coef_'):
-                # For logistic regression, show coefficient magnitudes
-                if len(best_model.coef_.shape) > 1:
-                    coef_importance = np.abs(best_model.coef_).mean(axis=0)
-                else:
-                    coef_importance = np.abs(best_model.coef_[0])
+            else:
+                st.info("Feature importance not available for this model type")
 
-                importance_df = pd.DataFrame({
-                    'Feature': available_features,
-                    'Importance': coef_importance
-                }).sort_values('Importance', ascending=False).head(10)
+        # Model insights
+        st.subheader("🔍 Model Insights")
 
-                fig_imp = px.bar(importance_df, x='Importance', y='Feature',
-                                 orientation='h', title=f'Feature Coefficients ({best_model_name})')
-                fig_imp.update_layout(height=400)
-                st.plotly_chart(fig_imp, use_container_width=True)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Best Accuracy", f"{best_accuracy:.3f}")
+        with col2:
+            st.metric("Best F1-Score", f"{best_f1:.3f}")
+        with col3:
+            st.metric("Features Used", len(analysis_results.get('feature_names', [])))
 
-    # Confusion Matrix and detailed results
-    if results:
-        st.subheader("📈 Model Validation")
-        best_model_name = max(results.keys(), key=lambda k: results[k]['accuracy'])
-        best_predictions = results[best_model_name]['predictions']
+        # Why this performs better
+        st.info("""
+        **🚀 Performance Improvements:**
+        - **Cross-validation**: More reliable performance estimates
+        - **Feature engineering**: Created meaningful derived features
+        - **Balanced training**: Handles class imbalance effectively
+        - **Feature selection**: Removed noisy variables
+        - **Better preprocessing**: Intelligent missing value handling
+        """)
 
-        # Confusion matrix
-        cm = confusion_matrix(y_test, best_predictions)
-        labels = best_model.classes_
+        return results, best_model_name, analysis_results.get('feature_names', []), target_choice
 
-        fig_cm = px.imshow(cm,
-                           text_auto=True,
-                           aspect="auto",
-                           title=f'{best_model_name} - Confusion Matrix',
-                           labels=dict(x="Predicted", y="Actual"),
-                           x=labels,
-                           y=labels)
-        st.plotly_chart(fig_cm, use_container_width=True)
-
-        # Classification report
-        st.subheader("🎯 Detailed Classification Report")
-        class_report = classification_report(y_test, best_predictions, output_dict=True)
-        report_df = pd.DataFrame(class_report).transpose()
-        st.dataframe(report_df.round(3))
-
-        return results, best_model_name, available_features, target_choice
-    else:
-        return None, None, available_features, target_choice
+    except Exception as e:
+        st.error(f"❌ Error in model building: {str(e)}")
+        st.info("💡 Try ensuring your data has the required columns and sufficient samples.")
+        return None, None, None, None
 
 
 def clean_data(df):
@@ -773,8 +917,8 @@ def generate_quality_report(initial_stats, metrics, cleaned_df, exploration_resu
         for name, results in model_results.items():
             model_data.append([
                 name,
-                f"{results['accuracy']:.3f}",
-                f"{results['f1_score']:.3f}"
+                f"{results['cv_accuracy_mean']:.3f}",
+                f"{results['cv_f1_mean']:.3f}"
             ])
 
         model_table = Table(model_data)
@@ -980,8 +1124,8 @@ def main():
                 for name, results in model_results.items():
                     comparison_data.append({
                         'Model': name,
-                        'Accuracy': results['accuracy'],
-                        'F1-Score': results['f1_score'],
+                        'Accuracy': results['cv_accuracy_mean'],
+                        'F1-Score': results['cv_f1_mean'],
                         'Status': '🥇 Best' if name == best_model_name else '✅ Good'
                     })
 
@@ -1019,7 +1163,7 @@ def main():
             with col1:
                 st.metric("Best Model", st.session_state.best_model_name)
             with col2:
-                best_accuracy = st.session_state.model_results[st.session_state.best_model_name]['accuracy']
+                best_accuracy = st.session_state.model_results[st.session_state.best_model_name]['cv_accuracy_mean']
                 st.metric("Best Accuracy", f"{best_accuracy:.3f}")
             with col3:
                 st.metric("Target Predicted", st.session_state.target_choice)
