@@ -1,4 +1,4 @@
-# 333app.py
+# app.py
 import numpy as np
 import streamlit as st
 import pandas as pd
@@ -28,7 +28,7 @@ warnings.filterwarnings('ignore')
 
 # Configure page
 st.set_page_config(page_title="Housing Quality Prediction Pipeline", layout="wide")
-st.title("🏠 Housing Quality Assessment & Prediction Pipeline")
+st.title("🏠 Advanced Housing Quality Assessment & Prediction Pipeline")
 
 # Enhanced Schema
 schema = pa.DataFrameSchema(
